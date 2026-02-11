@@ -1,229 +1,240 @@
 import streamlit as st
 import pandas as pd
-import io
+import re
 
-# --- 페이지 설정 ---
-st.set_page_config(page_title="NEIS 학생부 데이터 통합 도구", layout="wide")
-
-st.title("📊 학생부(행동특성/세특) 데이터 통합 정리 도구")
-st.markdown("""
-**[사용 안내]**
-1. 엑셀(xls, xlsx) 또는 CSV 파일을 업로드하세요.
-2. 파일 내용의 '번 호', '성 명' 등의 위치를 자동으로 찾아 데이터를 정리합니다.
-3. **행동특성**은 [학년]별로, **세특**은 [과목]별로 묶어 학생 1명당 1줄로 만듭니다.
-""")
-
-# --- 함수 정의 ---
-
-def find_header_row(df_raw):
+# -----------------------------------------------------------------------------
+# 1. 공통 함수: 학년 반 추출
+# -----------------------------------------------------------------------------
+def extract_grade_class(df_raw):
     """
-    데이터프레임 상단 20줄을 검사하여 
-    '번호'와 '성명'이 포함된(공백 무시) 행을 헤더로 간주하고 인덱스 반환
+    데이터프레임 상단(10행 이내)에서 '1학년 1반' 같은 패턴을 찾아 반환합니다.
+    못 찾으면 '미상'을 반환합니다.
     """
-    for i in range(min(20, len(df_raw))):
-        # 해당 행의 모든 값을 문자열로 합치고 공백 제거
-        row_str = "".join(df_raw.iloc[i].astype(str).tolist()).replace(" ", "").replace("\n", "")
-        
-        # '번호'와 '성명'이라는 글자가 모두 들어있으면 헤더로 판단
-        if "번호" in row_str and "성명" in row_str:
-            return i
-    return None
+    for i in range(min(10, len(df_raw))):
+        row_values = df_raw.iloc[i].astype(str).values
+        for val in row_values:
+            match = re.search(r"(\d+)학년\s*(\d+)반", val)
+            if match:
+                return match.group(0) # 예: "1학년 1반"
+    return "미상"
 
-def normalize_columns(df):
-    """컬럼명에서 공백과 줄바꿈을 제거하여 표준화"""
-    # 컬럼이 숫자로 된 경우(헤더를 못 찾은 경우) 대비
-    df.columns = df.columns.astype(str).str.replace(' ', '').str.replace('\n', '').str.strip()
-    return df
-
-def load_data(uploaded_file):
-    """업로드된 파일을 읽어서 적절한 헤더를 찾아 DataFrame으로 반환"""
-    file_ext = uploaded_file.name.split('.')[-1].lower()
+# -----------------------------------------------------------------------------
+# 2. 행동특성 및 종합의견(Hang) 처리 함수
+# -----------------------------------------------------------------------------
+def process_hang_file(uploaded_file):
+    # 헤더 위치를 찾기 위해 앞부분을 읽음
+    df_raw = pd.read_csv(uploaded_file, header=None)
+    grade_class = extract_grade_class(df_raw)
     
-    try:
-        # 1. 일단 헤더 없이 전체를 읽음 (데이터 위치 파악용)
-        if file_ext == 'csv':
-            try:
-                df_raw = pd.read_csv(uploaded_file, encoding='cp949', header=None)
-            except:
-                df_raw = pd.read_csv(uploaded_file, encoding='utf-8', header=None)
-        else:
-            df_raw = pd.read_excel(uploaded_file, header=None)
+    # 실제 헤더('번 호'가 있는 행) 찾기
+    header_idx = -1
+    for i, row in df_raw.iterrows():
+        if '번 호' in row.values and '성  명' in row.values:
+            header_idx = i
+            break
             
-        # 2. 실제 헤더가 있는 행 찾기
-        header_idx = find_header_row(df_raw)
-        
-        if header_idx is None:
-            # 헤더를 못 찾으면 처리 불가
-            return None
-        
-        # 3. 찾은 위치(header_idx)를 헤더로 하여 다시 읽기
-        if file_ext == 'csv':
-             try:
-                df = pd.read_csv(uploaded_file, encoding='cp949', skiprows=header_idx)
-             except:
-                df = pd.read_csv(uploaded_file, encoding='utf-8', skiprows=header_idx)
-        else:
-            df = pd.read_excel(uploaded_file, skiprows=header_idx)
-            
-        return normalize_columns(df)
-        
-    except Exception as e:
-        st.error(f"파일 읽기 오류 ({uploaded_file.name}): {e}")
+    if header_idx == -1:
+        st.error("행동특성 파일에서 헤더를 찾을 수 없습니다.")
         return None
 
-def process_data(files):
-    all_hang = []
-    all_kyo = []
+    # 헤더를 적용하여 다시 로드
+    df = pd.read_csv(uploaded_file, header=header_idx)
     
-    debug_logs = [] # 디버깅용 로그
+    # 컬럼 공백 제거 (예: "번 호" -> "번호")
+    df.columns = [str(col).replace(" ", "") for col in df.columns]
+    
+    # 필요한 컬럼만 선택 ('번호', '성명', '행동특성및종합의견')
+    # 파일마다 컬럼명이 조금 다를 수 있으므로 확인
+    target_cols = ['번호', '성명', '행동특성및종합의견']
+    
+    # 실제 존재하는 컬럼 매핑
+    col_mapping = {}
+    for col in df.columns:
+        if '번호' in col: col_mapping[col] = '번호'
+        elif '성명' in col: col_mapping[col] = '성명'
+        elif '행동특성' in col: col_mapping[col] = '내용' # 컬럼명을 '내용'으로 통일
+    
+    df = df.rename(columns=col_mapping)
+    
+    # 필수 컬럼이 있는지 확인
+    if '번호' not in df.columns or '내용' not in df.columns:
+        return None
 
-    for file in files:
-        df = load_data(file)
-        if df is None: 
-            debug_logs.append(f"❌ {file.name}: '번호', '성명' 헤더를 찾을 수 없음")
-            continue
-        
-        cols = df.columns.tolist()
-        
-        # 필수 컬럼 확인 (공백 제거된 상태)
-        if '번호' not in cols or '성명' not in cols:
-            debug_logs.append(f"❌ {file.name}: 필수 컬럼(번호, 성명) 누락. (발견된 컬럼: {cols})")
-            continue
+    # 1. 불필요한 행 제거 (헤더 반복, 날짜, 페이지 번호 등)
+    # 번호가 숫자가 아니거나 NaN인 경우 제거 (단, 내용이 이어진 경우를 위해 처리 필요)
+    # 로직: '번호'가 있고 '성명'이 있으면 새로운 학생 시작.
+    # '번호'가 NaN인데 '내용'만 있으면 이전 학생의 내용 연결.
+    
+    df['번호'] = pd.to_numeric(df['번호'], errors='coerce') # 숫자가 아니면 NaN
+    
+    # 번호와 성명을 아래로 채우기 (페이지 넘김으로 분리된 행 처리용)
+    # 주의: 원본 엑셀에서 페이지가 넘어가면 '번호'가 다시 나오지 않고 내용만 나오는 경우가 있음.
+    # 하지만 이 파일 구조상 중간에 헤더가 반복되므로, 헤더행을 먼저 날려야 함.
+    
+    # '내용' 컬럼이 비어있지 않은 행만 살리되, 헤더 반복행 제거
+    df = df[df['내용'].notna()]
+    df = df[~df['내용'].str.contains('행 동 특 성', na=False)] # 헤더 텍스트 제거
+    
+    # 번호 채우기 (Forward Fill)
+    df['번호'] = df['번호'].ffill()
+    
+    # 번호가 여전히 없는 행(문서 꼬리말 등) 제거
+    df = df.dropna(subset=['번호'])
+    
+    # 2. 내용 합치기 (행 분리된 텍스트 병합)
+    # 번호 기준으로 그룹화하여 내용 합침
+    df_grouped = df.groupby('번호')['내용'].apply(lambda x: ' '.join(x.astype(str))).reset_index()
+    
+    # 3. 최종 포맷 만들기
+    df_grouped['학년 반'] = grade_class
+    df_grouped['학기'] = '' # 행동특성은 보통 학기 구분 없음 (또는 1,2학기 통합)
+    df_grouped['과목/영역'] = '' # 과목 없음
+    
+    # 4. 정렬: 번호 순
+    df_grouped = df_grouped.sort_values(by='번호')
+    
+    # 컬럼 순서 정리
+    final_cols = ['학년 반', '번호', '학기', '과목/영역', '내용']
+    return df_grouped[final_cols]
 
-        # 번호 컬럼 숫자 변환 (결재란 등 문자열 제거)
+# -----------------------------------------------------------------------------
+# 3. 세부능력 및 특기사항(Kyo) 처리 함수
+# -----------------------------------------------------------------------------
+def process_kyo_file(uploaded_file):
+    df_raw = pd.read_csv(uploaded_file, header=None)
+    grade_class = extract_grade_class(df_raw)
+    
+    # 헤더 찾기
+    header_idx = -1
+    for i, row in df_raw.iterrows():
+        if '과 목' in row.values and '성  명' in row.values:
+            header_idx = i
+            break
+            
+    if header_idx == -1:
+        st.error("세특 파일에서 헤더를 찾을 수 없습니다.")
+        return None
+
+    df = pd.read_csv(uploaded_file, header=header_idx)
+    df.columns = [str(col).replace(" ", "") for col in df.columns] # 공백 제거
+    
+    # 컬럼 매핑
+    # 예상 컬럼: 과목, 학년, 학기, 번호, 성명, 세부능력및특기사항
+    rename_map = {}
+    for col in df.columns:
+        if '과목' in col: rename_map[col] = '과목/영역'
+        elif '학기' in col: rename_map[col] = '학기'
+        elif '번호' in col: rename_map[col] = '번호'
+        elif '세부능력' in col: rename_map[col] = '내용'
+    
+    df = df.rename(columns=rename_map)
+    
+    # 데이터 정제
+    # 1. 헤더 반복 및 불필요한 행 제거
+    df['번호'] = pd.to_numeric(df['번호'], errors='coerce')
+    
+    # 과목, 학기, 번호 Forward Fill (페이지 넘김 대응)
+    # 주의: 중간에 끼어든 헤더 행('과목', '학기' 등이 적힌 행)은 fill하기 전에 제외해야 꼬이지 않음
+    # 하지만 fill을 해야 헤더인지 알 수 있는 경우도 있음.
+    # 전략: 일단 내용을 기준으로 필터링 후 ffill
+    
+    # 의미 없는 행 제거 (내용이 NaN인 경우) -> 단, 내용이 다음 줄로 넘어간 경우 내용이 NaN일 수 있나?
+    # 분석 결과: 세특은 보통 [과목, ..., 내용]이 한 줄에 있거나, 내용만 다음 줄에 있음.
+    # 내용만 있는 줄은 과목, 번호가 NaN임.
+    
+    # 우선 '내용'이 있는 행만 남기기 전에, 번호가 있는 행을 기준으로 ffill을 해야 함.
+    # 그러나 중간에 '페이지 번호'나 '학교명' 등은 번호도 없고 내용도 쓸모 없음.
+    
+    # 과목/영역이 '과목'인 행(반복 헤더) 제거
+    df = df[df['과목/영역'] != '과 목']
+    df = df[df['과목/영역'] != '과목']
+    
+    # ffill 수행
+    df['번호'] = df['번호'].ffill()
+    df['과목/영역'] = df['과목/영역'].ffill()
+    df['학기'] = df['학기'].ffill()
+    
+    # 번호가 NaN인 행은(맨 위 헤더 이전의 쓰레기값) 제거
+    df = df.dropna(subset=['번호'])
+    
+    # 내용이 비어있지 않은 행만 선택 (페이지 번호 등 제거)
+    df = df.dropna(subset=['내용'])
+    
+    # 2. 내용 합치기 (행 분리 병합)
+    # 그룹 키: 번호, 학기, 과목
+    df_grouped = df.groupby(['번호', '학기', '과목/영역'])['내용'].apply(lambda x: ' '.join(x.astype(str))).reset_index()
+    
+    # 3. 최종 포맷
+    df_grouped['학년 반'] = grade_class
+    
+    # 4. 정렬: 과목명 - 번호 순
+    df_grouped = df_grouped.sort_values(by=['과목/영역', '번호'])
+    
+    final_cols = ['학년 반', '번호', '학기', '과목/영역', '내용']
+    return df_grouped[final_cols]
+
+# -----------------------------------------------------------------------------
+# 메인 UI
+# -----------------------------------------------------------------------------
+st.title("🏫 생기부(행특/세특) 정리 도구")
+st.markdown("""
+**사용 방법:**
+1. 엑셀에서 변환된 **CSV 파일**을 업로드하세요.
+2. 페이지 넘김으로 분리된 텍스트가 합쳐지고, 불필요한 행이 제거됩니다.
+3. **학생 이름은 자동으로 익명화**됩니다.
+""")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("1. 행동특성(행특) 파일")
+    file_hang = st.file_uploader("행동특성 CSV 업로드", type=['csv'], key='hang')
+
+with col2:
+    st.subheader("2. 세부능력(세특) 파일")
+    file_kyo = st.file_uploader("세특 CSV 업로드", type=['csv'], key='kyo')
+
+if st.button("파일 처리 및 결과 보기"):
+    result_dfs = []
+    
+    if file_hang:
         try:
-            df['번호'] = pd.to_numeric(df['번호'], errors='coerce')
-            df = df.dropna(subset=['번호']) # 번호 없는 행 삭제
-            df['번호'] = df['번호'].astype(int)
-        except:
-            debug_logs.append(f"⚠️ {file.name}: 번호 컬럼 변환 중 오류 발생")
-            continue
-        
-        # 유형 1: 행동특성 (행동특성... 컬럼 존재 여부 확인)
-        # '행동특성및종합의견' 처럼 긴 이름일 수 있으므로 포함 여부로 확인
-        hang_col = next((c for c in cols if '행동특성' in c), None)
-        
-        if hang_col:
-            debug_logs.append(f"✅ {file.name}: 행동특성 파일로 인식")
-            target_cols = ['번호', '성명', '학년', hang_col]
-            available_cols = [c for c in target_cols if c in df.columns]
-            temp_df = df[available_cols].copy()
-            temp_df.rename(columns={hang_col: '내용'}, inplace=True)
-            if '학년' not in temp_df.columns: temp_df['학년'] = ''
-            all_hang.append(temp_df)
-            continue # 행동특성이면 세특 검사 건너뜀
-            
-        # 유형 2: 교과세특 (세부능력... 및 과목 컬럼 존재 여부 확인)
-        kyo_col = next((c for c in cols if '세부능력' in c), None)
-        subj_col = next((c for c in cols if '과목' in c), None)
-        
-        if kyo_col and subj_col:
-            debug_logs.append(f"✅ {file.name}: 교과세특 파일로 인식")
-            target_cols = ['번호', '성명', '학년', '학기', subj_col, kyo_col]
-            available_cols = [c for c in target_cols if c in df.columns]
-            temp_df = df[available_cols].copy()
-            temp_df.rename(columns={kyo_col: '내용', subj_col: '과목'}, inplace=True)
-            all_kyo.append(temp_df)
-        else:
-             debug_logs.append(f"❓ {file.name}: 알 수 없는 파일 형식 (주요 컬럼 미발견)")
+            file_hang.seek(0)
+            df_hang = process_hang_file(file_hang)
+            if df_hang is not None:
+                st.success(f"행동특성 처리 완료: {len(df_hang)}명 데이터")
+                result_dfs.append(df_hang)
+        except Exception as e:
+            st.error(f"행동특성 처리 중 오류 발생: {e}")
 
-    # --- 데이터 병합 및 정리 ---
-    
-    result_dfs = {}
+    if file_kyo:
+        try:
+            file_kyo.seek(0)
+            df_kyo = process_kyo_file(file_kyo)
+            if df_kyo is not None:
+                st.success(f"세특 처리 완료: {len(df_kyo)}건 데이터")
+                result_dfs.append(df_kyo)
+        except Exception as e:
+            st.error(f"세특 처리 중 오류 발생: {e}")
 
-    # 1. 행동특성 정리
-    if all_hang:
-        df_hang_total = pd.concat(all_hang)
-        # 포맷팅
-        df_hang_total['formatted'] = df_hang_total.apply(
-            lambda x: f"[{x['학년']}학년] {x['내용']}" if str(x['학년']).strip() else f"{x['내용']}", axis=1
+    if result_dfs:
+        # 두 결과 합치기 (행특 + 세특)
+        final_df = pd.concat(result_dfs, ignore_index=True)
+        
+        # 학년 반 - 번호 순으로 최종 정렬하고 싶다면 아래 주석 해제 (현재 요구사항은 파일별 정렬)
+        # final_df = final_df.sort_values(by=['번호']) 
+        
+        st.write("### 처리 결과 미리보기")
+        st.dataframe(final_df)
+        
+        # 다운로드 버튼
+        # CSV 변환
+        csv = final_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="CSV로 다운로드",
+            data=csv,
+            file_name='생기부_정리_완료.csv',
+            mime='text/csv',
         )
-        # 같은 번호끼리 묶기
-        df_hang_grouped = df_hang_total.groupby(['번호', '성명'])['formatted'].apply(lambda x: '\n\n'.join(x)).reset_index()
-        df_hang_grouped = df_hang_grouped.sort_values(by='번호')
-        df_hang_grouped.columns = ['번호', '성명', '행동특성_통합']
-        result_dfs['행동특성_정리'] = df_hang_grouped
-
-    # 2. 교과세특 정리
-    if all_kyo:
-        df_kyo_total = pd.concat(all_kyo)
-        
-        # 학기 빈값 처리
-        if '학기' in df_kyo_total.columns:
-            df_kyo_total['학기'] = df_kyo_total['학기'].fillna(0)
-        else:
-            df_kyo_total['학기'] = 0
-            
-        # 정렬: 번호 -> 과목 -> 학기 순
-        df_kyo_total = df_kyo_total.sort_values(by=['번호', '과목', '학기'])
-        
-        # 포맷팅
-        def format_kyo(row):
-            meta_parts = [str(row['과목'])]
-            if pd.notnull(row['학년']) and str(row['학년']).strip():
-                meta_parts.append(f"{row['학년']}학년")
-            if pd.notnull(row['학기']) and str(row['학기']) not in ['0', '0.0', '']:
-                meta_parts.append(f"{row['학기']}학기")
-            
-            meta_info = " | ".join(meta_parts)
-            return f"[{meta_info}]\n{row['내용']}"
-
-        df_kyo_total['formatted'] = df_kyo_total.apply(format_kyo, axis=1)
-        
-        # 묶기
-        df_kyo_grouped = df_kyo_total.groupby(['번호', '성명'])['formatted'].apply(lambda x: '\n\n'.join(x)).reset_index()
-        df_kyo_grouped = df_kyo_grouped.sort_values(by='번호')
-        df_kyo_grouped.columns = ['번호', '성명', '과목세특_통합']
-        result_dfs['세부능력_정리'] = df_kyo_grouped
-
-    return result_dfs, debug_logs
-
-# --- UI 및 실행 로직 ---
-
-uploaded_files = st.file_uploader("엑셀 또는 CSV 파일들을 업로드하세요", 
-                                  type=['xlsx', 'xls', 'csv'], 
-                                  accept_multiple_files=True)
-
-if uploaded_files:
-    if st.button("파일 분석 및 변환하기"):
-        with st.spinner('파일을 분석하고 데이터를 병합하는 중입니다...'):
-            results, logs = process_data(uploaded_files)
-            
-            # 로그 출력 (오류 원인 파악용)
-            with st.expander("처리 로그 확인 (문제가 있다면 눌러보세요)"):
-                for log in logs:
-                    st.write(log)
-
-            if not results:
-                st.error("⚠️ 처리할 수 있는 데이터가 없습니다. 위의 '처리 로그'를 확인해 보세요.")
-            else:
-                st.success("✅ 변환이 완료되었습니다!")
-                
-                # 엑셀 다운로드
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    for sheet_name, df in results.items():
-                        df.to_excel(writer, sheet_name=sheet_name, index=False)
-                        
-                        # 스타일링
-                        workbook = writer.book
-                        worksheet = writer.sheets[sheet_name]
-                        text_format = workbook.add_format({'text_wrap': True, 'valign': 'top'})
-                        worksheet.set_column('A:A', 5, text_format)
-                        worksheet.set_column('B:B', 10, text_format)
-                        worksheet.set_column('C:C', 80, text_format)
-
-                output.seek(0)
-                
-                st.download_button(
-                    label="📥 통합 엑셀 파일 다운로드",
-                    data=output,
-                    file_name="학생부_통합_정리.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-                # 미리보기
-                st.markdown("---")
-                for name, df in results.items():
-                    st.subheader(f"📑 {name}")
-                    st.dataframe(df.head())
+    else:
+        st.warning("처리할 파일이 없거나 오류가 발생했습니다.")
