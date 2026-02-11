@@ -3,29 +3,26 @@ import pandas as pd
 import io
 
 # 페이지 기본 설정
-st.set_page_config(page_title="나이스 데이터 정리 도구 (익명)", layout="wide")
+st.set_page_config(page_title="나이스 데이터 정리 도구 (분리형)", layout="wide")
 
-st.title("📂 학교생활기록부 데이터 정리 도구 (익명)")
+st.title("📂 학교생활기록부 데이터 정리 도구")
 st.markdown("""
-나이스에서 다운로드한 **행동특성 및 종합의견** 혹은 **세부능력 및 특기사항** 엑셀 파일을 업로드하세요.
-- **결과 파일에는 '성명'이 포함되지 않고 '번호'만 남습니다.**
-- 불필요한 상단 정보를 자동으로 찾아 제거합니다.
-- 같은 번호를 가진 행들의 내용을 하나로 합쳐줍니다.
+나이스 엑셀 파일을 업로드하면 **성명을 제외하고** 깔끔하게 정리해줍니다.
+- **세부능력 및 특기사항**: 과목별로 행이 분리되며, `과목 > 학기 > 번호` 순으로 정렬됩니다.
+- **행동특성 및 종합의견**: 학생별로 정리되며, `번호` 순으로 정렬됩니다.
 """)
 
 # --------------------------------------------------------------------------------
-# 함수 정의: 데이터 전처리 및 병합 로직
+# 함수 정의: 텍스트 병합 및 데이터 처리
 # --------------------------------------------------------------------------------
 def process_data(file):
     try:
-        # 1. 헤더 위치 찾기 ('번 호'가 있는 행을 찾습니다)
-        # 성명이 없어도 작동하도록 '번 호' 키워드 위주로 찾습니다.
+        # 1. 헤더 위치 찾기 ('번 호'가 있는 행 찾기)
         temp_df = pd.read_excel(file, header=None, nrows=10)
         header_row_index = -1
         
         for i, row in temp_df.iterrows():
             row_values = row.astype(str).values
-            # '번 호'라는 글자가 포함된 행을 헤더로 인식
             if any("번 호" in s for s in row_values):
                 header_row_index = i
                 break
@@ -33,96 +30,158 @@ def process_data(file):
         if header_row_index == -1:
             return None, "표의 헤더('번 호')를 찾을 수 없습니다."
 
-        # 2. 찾은 위치를 기준으로 파일 읽기
-        file.seek(0) 
+        # 2. 데이터 로드
+        file.seek(0)
         df = pd.read_excel(file, header=header_row_index)
 
-        # 3. 데이터 클렌징
-        # 컬럼명 공백 제거 (예: "번 호" -> "번호")
-        df.columns = [c.replace(" ", "") if isinstance(c, str) else c for c in df.columns]
+        # 3. 컬럼명 전처리 (공백 제거)
+        df.columns = [str(c).replace(" ", "") for c in df.columns]
         
         if '번호' not in df.columns:
              return None, "'번호' 컬럼을 찾을 수 없습니다."
 
-        # 번호의 빈칸 채우기 (ffill)
-        df['번호'] = df['번호'].fillna(method='ffill')
-        
-        # (옵션) 성명 컬럼이 있다면 내부 처리를 위해 빈칸은 채우되, 결과엔 안 씀
+        # 4. 공통 전처리: 번호, 학년 등 빈칸 채우기 (Merge 된 셀 처리)
+        # 번호, 학년, 반, 성명 등은 기본적으로 채워야 함
+        cols_to_fill = ['번호', '학년', '반']
         if '성명' in df.columns:
-            df['성명'] = df['성명'].fillna(method='ffill')
-
-        # 4. 내용 합치기
-        # 합칠 대상 컬럼 찾기 (번호, 성명, 학년, 반, 학기 등을 제외한 긴 텍스트)
-        exclude_cols = ['번호', '성명', '학년', '반', '학기', '이수단위', '원점수', '과목', '성취도/석차등급', '석차등급', '성취도']
-        target_cols = [c for c in df.columns if c not in exclude_cols]
-
-        # 병합 로직 함수
-        def merge_text(x):
-            # 내용이 있는 것만 골라서 줄바꿈으로 연결
-            return "\n".join([str(s) for s in x if pd.notnull(s) and str(s).strip() != ""])
-
-        # '과목' 컬럼이 있다면 내용을 "[과목명] 내용" 형태로 변환
+            cols_to_fill.append('성명')
+        if '학기' in df.columns:
+            cols_to_fill.append('학기')
         if '과목' in df.columns:
-             # 과목명도 빈칸이면 채워줌
-             df['과목'] = df['과목'].fillna(method='ffill')
-             df['내용병합'] = "[" + df['과목'].astype(str) + "] " + df[target_cols[0]].astype(str)
-             target_col_name = '내용병합'
-        else:
-             # 과목 컬럼이 없으면(행동특성 등) 첫번째 긴 텍스트 컬럼 사용
-             target_col_name = target_cols[0] if target_cols else None
+            cols_to_fill.append('과목')
 
-        if not target_col_name:
-            return None, "합칠 내용이 있는 컬럼을 찾지 못했습니다."
+        for col in cols_to_fill:
+            if col in df.columns:
+                df[col] = df[col].fillna(method='ffill')
 
-        # ★ 핵심 수정 사항: 그룹화 기준에서 '성명'을 제거하고 '번호'로만 묶습니다.
-        # 이렇게 하면 결과 데이터프레임에 '성명' 컬럼이 생성되지 않습니다.
-        result_df = df.groupby(['번호'])[target_col_name].apply(merge_text).reset_index()
+        # 5. 파일 종류 판별 및 분기 처리
         
-        # 번호 순으로 정렬 (숫자로 변환 후 정렬)
-        result_df['번호'] = pd.to_numeric(result_df['번호'], errors='coerce')
-        result_df = result_df.sort_values('번호')
+        # --- CASE A: 세부능력 및 특기사항 (과목 컬럼이 있음) ---
+        if '과목' in df.columns:
+            st.info("💡 [세부능력 및 특기사항] 파일로 인식되었습니다.")
+            
+            # 내용이 들어있는 컬럼 찾기 (제외할 컬럼들을 뺀 나머지)
+            exclude_cols = ['번호', '성명', '학년', '반', '학기', '이수단위', '원점수', '과목', '성취도/석차등급', '석차등급', '성취도', '과목평균', '표준편차']
+            content_col = [c for c in df.columns if c not in exclude_cols][0] # 보통 하나만 남음
+            
+            # 내용 병합 함수
+            def merge_text(x):
+                return "\n".join([str(s) for s in x if pd.notnull(s) and str(s).strip() != ""])
+
+            # 그룹화: 과목, 학년, 학기, 번호 기준으로 묶음 (성명 제외)
+            # 이렇게 해야 같은 학생의 같은 과목 내용이 여러 줄일 때 하나로 합쳐짐
+            result_df = df.groupby(['과목', '학년', '학기', '번호'])[content_col].apply(merge_text).reset_index()
+            
+            # 컬럼 이름 변경 (명확하게)
+            result_df.rename(columns={content_col: '세부능력 및 특기사항'}, inplace=True)
+            
+            # 정렬: 과목 -> 학기 -> 번호
+            # 정렬을 위해 번호와 학기를 숫자로 변환
+            result_df['번호_숫자'] = pd.to_numeric(result_df['번호'], errors='coerce')
+            result_df['학기_숫자'] = pd.to_numeric(result_df['학기'], errors='coerce')
+            
+            result_df = result_df.sort_values(by=['과목', '학기_숫자', '번호_숫자'])
+            
+            # 최종 출력 컬럼 순서 지정 (요청사항: 번호-과목-학년-학기-내용)
+            final_cols = ['번호', '과목', '학년', '학기', '세부능력 및 특기사항']
+            result_df = result_df[final_cols]
+
+
+        # --- CASE B: 행동특성 및 종합의견 (과목 컬럼이 없음) ---
+        else:
+            st.info("💡 [행동특성 및 종합의견] 파일로 인식되었습니다.")
+            
+            # 내용 컬럼 찾기
+            exclude_cols = ['번호', '성명', '학년', '반']
+            content_col = [c for c in df.columns if c not in exclude_cols][0]
+
+            def merge_text(x):
+                return "\n".join([str(s) for s in x if pd.notnull(s) and str(s).strip() != ""])
+
+            # 그룹화: 번호, 학년 기준으로 묶음
+            result_df = df.groupby(['번호', '학년'])[content_col].apply(merge_text).reset_index()
+            
+            # 컬럼 이름 변경
+            result_df.rename(columns={content_col: '행동특성 및 종합의견'}, inplace=True)
+            
+            # 정렬: 번호순
+            result_df['번호_숫자'] = pd.to_numeric(result_df['번호'], errors='coerce')
+            result_df = result_df.sort_values(by=['번호_숫자'])
+            
+            # 최종 출력 컬럼 순서 지정 (요청사항: 번호-학년-내용)
+            final_cols = ['번호', '학년', '행동특성 및 종합의견']
+            result_df = result_df[final_cols]
 
         return result_df, None
 
     except Exception as e:
-        return None, str(e)
+        return None, f"오류 발생: {str(e)}\n(올바른 엑셀 파일인지 확인해주세요)"
 
 # --------------------------------------------------------------------------------
 # 메인 UI
 # --------------------------------------------------------------------------------
-uploaded_file = st.file_uploader("엑셀 파일(.xlsx)을 드래그하거나 선택하세요", type=['xlsx'])
+uploaded_file = st.file_uploader("나이스 엑셀 파일(.xlsx) 업로드", type=['xlsx'])
 
 if uploaded_file:
-    with st.spinner('파일을 분석하고 정리하는 중입니다...'):
+    with st.spinner('데이터 분석 및 정리 중...'):
         processed_df, error_msg = process_data(uploaded_file)
         
     if error_msg:
-        st.error(f"오류가 발생했습니다: {error_msg}")
+        st.error(error_msg)
     else:
-        st.success("정리가 완료되었습니다! (성명 제외됨)")
+        st.success("정리 완료!")
         
-        # 결과 미리보기
-        st.dataframe(processed_df)
+        # 데이터프레임 보여주기 (처음 5행만 보여주거나 전체 보여주기)
+        st.dataframe(processed_df, use_container_width=True)
         
-        # 다운로드 버튼
+        # 엑셀 다운로드 준비
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             processed_df.to_excel(writer, index=False, sheet_name='Sheet1')
             
-            # 엑셀 서식 다듬기
+            # 서식 설정
             workbook = writer.book
             worksheet = writer.sheets['Sheet1']
-            format_text = workbook.add_format({'text_wrap': True, 'valign': 'top'})
             
-            # A열(번호) 너비 줄이고, B열(내용) 너비 넓힘
-            worksheet.set_column('A:A', 10)
-            worksheet.set_column('B:B', 60, format_text)
+            # 스타일 정의
+            header_format = workbook.add_format({
+                'bold': True,
+                'text_wrap': True,
+                'valign': 'vcenter',
+                'fg_color': '#D7E4BC',
+                'border': 1
+            })
+            text_format = workbook.add_format({
+                'text_wrap': True, 
+                'valign': 'top',
+                'border': 1
+            })
+            center_format = workbook.add_format({
+                'align': 'center', 
+                'valign': 'top',
+                'border': 1
+            })
+
+            # 컬럼 너비 및 서식 적용
+            # A열(번호) ~ 마지막 열까지 순회
+            for col_num, col_name in enumerate(processed_df.columns):
+                # 내용이 들어가는 긴 컬럼인지 확인 (이름이 긴 것들)
+                if "세부능력" in col_name or "행동특성" in col_name:
+                    worksheet.set_column(col_num, col_num, 60, text_format) # 너비 60
+                else:
+                    worksheet.set_column(col_num, col_num, 8, center_format) # 너비 8, 가운데 정렬
+
+            # 헤더 서식 적용
+            for col_num, value in enumerate(processed_df.columns.values):
+                worksheet.write(0, col_num, value, header_format)
             
         processed_data = output.getvalue()
         
+        file_prefix = "세특정리" if "세부능력" in processed_df.columns[-1] else "행특정리"
+        
         st.download_button(
-            label="📥 정리된 엑셀 파일 다운로드 (익명)",
+            label="📥 정리된 엑셀 파일 다운로드",
             data=processed_data,
-            file_name=f"정리된_{uploaded_file.name}",
+            file_name=f"{file_prefix}_{uploaded_file.name}",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
