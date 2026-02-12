@@ -52,7 +52,6 @@ def detect_file_type(df_raw):
 
 def process_hang(df_raw, grade_class):
     """행동특성 처리"""
-    # 헤더 찾기
     header_idx = -1
     for i, row in df_raw.iterrows():
         row_str = row.astype(str).values
@@ -65,7 +64,6 @@ def process_hang(df_raw, grade_class):
     df = df_raw.iloc[header_idx+1:].copy()
     df.columns = df_raw.iloc[header_idx].astype(str).str.replace(" ", "")
     
-    # 컬럼 매핑
     rename_map = {}
     for col in df.columns:
         if '번호' in col: rename_map[col] = '번호'
@@ -73,6 +71,7 @@ def process_hang(df_raw, grade_class):
         elif '종합의견' in col: rename_map[col] = '내용'
     df = df.rename(columns=rename_map)
     
+    # 필수 컬럼 확인
     if '번호' not in df.columns or '내용' not in df.columns: return None
         
     df['번호'] = pd.to_numeric(df['번호'], errors='coerce')
@@ -85,11 +84,10 @@ def process_hang(df_raw, grade_class):
     
     df_grouped = df.groupby('번호')['내용'].apply(lambda x: ' '.join(x.astype(str))).reset_index()
     
-    # 최종 포맷 맞추기
     df_grouped['학년 반'] = grade_class
     df_grouped['학기'] = ''
     df_grouped['과목/영역'] = '행동특성'
-    df_grouped['시수'] = '' # 행특은 시수 없음
+    df_grouped['시수'] = ''
     
     return df_grouped[['학년 반', '번호', '학기', '과목/영역', '시수', '내용']]
 
@@ -119,12 +117,8 @@ def process_kyo(df_raw, grade_class):
     if '내용' not in df.columns or '과목/영역' not in df.columns: return None
 
     df['번호'] = pd.to_numeric(df['번호'], errors='coerce')
-    
-    # 불필요한 행 제거
     df = df[df['과목/영역'] != '과 목']
     df = df[df['과목/영역'] != '과목']
-    
-    # 값 채우기
     df['번호'] = df['번호'].ffill()
     df['과목/영역'] = df['과목/영역'].ffill()
     df['학기'] = df['학기'].ffill()
@@ -133,28 +127,43 @@ def process_kyo(df_raw, grade_class):
     
     df_grouped = df.groupby(['번호', '학기', '과목/영역'])['내용'].apply(lambda x: ' '.join(x.astype(str))).reset_index()
     
-    # 최종 포맷
     df_grouped['학년 반'] = grade_class
-    df_grouped['시수'] = '' # 세특은 시수 없음
+    df_grouped['시수'] = '' 
     
     return df_grouped[['학년 반', '번호', '학기', '과목/영역', '시수', '내용']]
 
 def process_chang(df_raw, grade_class):
-    """창의적 체험활동(자율/진로) 처리"""
+    """창의적 체험활동(자율/진로) 처리 - 수정됨"""
     header_idx = -1
     for i, row in df_raw.iterrows():
         row_str = row.astype(str).values
-        # '영 역'과 '시 간'이 포함된 헤더 찾기
         if any('영' in s and '역' in s for s in row_str) and any('시' in s and '간' in s for s in row_str):
             header_idx = i
             break
             
     if header_idx == -1: return None
-        
-    df = df_raw.iloc[header_idx+1:].copy()
-    df.columns = df_raw.iloc[header_idx].astype(str).str.replace(" ", "")
     
-    # 컬럼 매핑 (창체 특화)
+    # [수정] 2단 헤더 병합 로직 (번호/성명이 위쪽 행에 있는 경우 대응)
+    # 현재 헤더(영역, 시간 등) 가져오기
+    cols = df_raw.iloc[header_idx].fillna('').astype(str).values.tolist()
+    
+    # 바로 위 행(번호, 성명 등) 가져와서 빈칸 채우기
+    if header_idx > 0:
+        upper_row = df_raw.iloc[header_idx - 1].fillna('').astype(str).values.tolist()
+        for i in range(len(cols)):
+            # 현재 컬럼명이 비어있거나 nan이면 위쪽 행의 값을 가져옴
+            if cols[i].strip() == '' or cols[i].lower() == 'nan':
+                if i < len(upper_row) and upper_row[i].strip() != '' and upper_row[i].lower() != 'nan':
+                    cols[i] = upper_row[i]
+    
+    # 공백 제거
+    cols = [c.replace(" ", "") for c in cols]
+    
+    # 데이터 프레임 생성
+    df = df_raw.iloc[header_idx+1:].copy()
+    df.columns = cols
+    
+    # 컬럼 매핑
     rename_map = {}
     for col in df.columns:
         if '번호' in col: rename_map[col] = '번호'
@@ -164,49 +173,44 @@ def process_chang(df_raw, grade_class):
     
     df = df.rename(columns=rename_map)
     
-    if '내용' not in df.columns or '과목/영역' not in df.columns: return None
+    # [수정] 필수 컬럼 체크에 '번호' 추가
+    if '번호' not in df.columns or '내용' not in df.columns or '과목/영역' not in df.columns:
+        return None
 
     # 데이터 정제
     df['번호'] = pd.to_numeric(df['번호'], errors='coerce')
     
-    # 1. 헤더 반복 제거
     df = df[df['과목/영역'] != '영 역']
     df = df[df['과목/영역'] != '영역']
     
-    # 2. 값 채우기 (페이지 넘김 대응)
     df['번호'] = df['번호'].ffill()
     df['과목/영역'] = df['과목/영역'].ffill()
     df['시수'] = df['시수'].ffill()
     
-    # 3. 유효한 데이터 필터링
     df = df.dropna(subset=['번호'])
     
-    # [중요] 진로활동의 '희망분야' 행 제거
-    # '내용' 컬럼에 '희망분야'라는 글자가 있거나, '조리사' 처럼 직업명만 있는 경우(보통 5글자 이하)를 주의해야 함.
-    # 하지만 CSV 구조상 '희망분야' 라벨이 있는 행은 '내용' 컬럼에 '희망분야'라고 찍혀있을 확률이 높음.
+    # 진로활동 '희망분야' 행 제거
     df = df[df['내용'].astype(str) != '희망분야']
-    df = df[~df['내용'].astype(str).str.contains('희망분야', na=False)] # 희망분야 텍스트 포함 행 삭제
+    df = df[~df['내용'].astype(str).str.contains('희망분야', na=False)]
     
-    # 내용이 비어있지 않은 것만 남기되, 진로활동의 경우 내용이 다음 줄에 있을 수 있으므로
-    # 위에서 ffill을 했지만, 내용은 ffill하면 안됨 (서로 다른 내용이 섞임).
-    # 따라서 내용은 비어있는 행을 제거해야 함.
     df = df.dropna(subset=['내용'])
 
-    # 4. 내용 병합
+    # 내용 병합
     df_grouped = df.groupby(['번호', '과목/영역', '시수'])['내용'].apply(lambda x: ' '.join(x.astype(str))).reset_index()
     
-    # 최종 포맷
     df_grouped['학년 반'] = grade_class
-    df_grouped['학기'] = '' # 창체는 보통 학기 구분 없이 통년
+    df_grouped['학기'] = '' 
     
     return df_grouped[['학년 반', '번호', '학기', '과목/영역', '시수', '내용']]
-
 
 def detect_duplicates(df):
     """복붙(중복) 문장 탐지"""
     sentence_pattern = re.compile(r'[^.!?]+[.!?]')
     df['중복여부'] = False
     df['비고(중복문장)'] = ''
+    
+    # 과목/영역이 비어있는 경우(NaN) 처리
+    df['과목/영역'] = df['과목/영역'].fillna('기타')
     
     for subject, group in df.groupby('과목/영역'):
         if len(group) < 2: continue
@@ -257,7 +261,7 @@ def to_excel_with_style(df):
         styler.to_excel(writer, index=False, columns=save_cols, sheet_name='정리결과')
         worksheet = writer.sheets['정리결과']
         for idx, col in enumerate(save_cols):
-            width = 50 if '내용' in col or '비고' in col else 10
+            width = 50 if '내용' in col or '비고' in col else 12
             worksheet.column_dimensions[chr(65 + idx)].width = width
             
     return output.getvalue()
@@ -320,17 +324,10 @@ if uploaded_files:
         status.update(label="모든 파일 처리 완료!", state="complete", expanded=False)
 
     if all_results:
-        # 1. 통합
         final_df = pd.concat(all_results, ignore_index=True)
-        
-        # 2. 정렬 (요청사항: 과목/영역 -> 번호 순)
-        # 시수는 정렬에 영향 없으나 보기 좋게 포함 가능
         final_df = final_df.sort_values(by=['과목/영역', '번호'])
-        
-        # 3. 중복 분석
         final_df = detect_duplicates(final_df)
         
-        # 4. 미리보기
         st.divider()
         st.subheader("📊 결과 미리보기")
         
@@ -347,7 +344,6 @@ if uploaded_files:
             use_container_width=True
         )
         
-        # 5. 다운로드
         excel_data = to_excel_with_style(final_df)
         
         st.download_button(
